@@ -119,6 +119,9 @@ class DynamicLayer(CacheLayerMixin):
 
         self.keys = torch.cat([self.keys, key_states], dim=-2)
         self.values = torch.cat([self.values, value_states], dim=-2)
+        # torch.set_printoptions(profile="full")
+        # print(self.keys)
+        # print(self.values)
         return self.keys, self.values
 
     def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
@@ -678,6 +681,161 @@ class HQQQuantizedLayer(QuantizedLayer):
         tensor = self.quantizer.dequantize(quant_tensor, meta)
         return tensor
 
+class ThinKLayer(CacheLayerMixin):
+    """
+    A cache layer implementing ThinK (channel-level key pruning).
+    
+    Instead of pruning tokens, ThinK prunes key *channels* (head_dim dimensions)
+    that are deemed unimportant based on query-key importance scoring. The recent
+    `recent_size` tokens are always kept intact. Values are never pruned.
+
+    Stores:
+        keys_pruned:  [B, H, seq-recent, head_dim - k]  (compressed old tokens)
+        keys_recent:  [B, H, recent_size, head_dim]      (full recent window)
+        values:       [B, H, seq_len, head_dim]          (never pruned)
+        channel_mask: [B, H, head_dim] bool, True = pruned channel
+    """
+    is_sliding = False
+
+    def __init__(self, recent_size: int = 128, ratio: float = 0.3):
+        super().__init__()
+        self.recent_size = recent_size
+        self.ratio = ratio           # fraction of channels to prune
+        # Separate storage for pruned-old vs full-recent keys
+        self.keys_pruned: torch.Tensor | None = None   # compressed
+        self.keys_recent: torch.Tensor | None = None   # full
+        self.channel_mask: torch.Tensor | None = None  # [B, H, D] bool
+        # values is inherited from CacheLayerMixin as self.values
+        self.cumulative_length = 0
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.dtype, self.device = key_states.dtype, key_states.device
+        self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.keys_pruned = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.keys_recent = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.is_initialized = True
+
+    @staticmethod
+    def _score_channels(
+        key_states: torch.Tensor,   # [B, H, S, D]
+        query_states: torch.Tensor, # [B, H, S, D]
+    ) -> torch.Tensor:
+        """
+        Compute per-channel importance as element-wise product of
+        mean-squared query and mean-squared key values.
+        Returns shape [B, H, D].
+        """
+        # Use last 32 query positions for efficiency (following the paper)
+        q_norm = query_states[..., -32:, :].pow(2).mean(dim=2)   # [B, H, D]
+        k_norm = key_states.pow(2).mean(dim=2)                    # [B, H, D]
+        return q_norm * k_norm                                    # [B, H, D]
+
+    def _prune_channels(
+        self,
+        key_states: torch.Tensor,   # [B, H, S, D]
+        query_states: torch.Tensor, # [B, H, S, D] — only used for scoring
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Score channels, select bottom-k to prune, return:
+          keys_pruned:  [B, H, S, D-k]   (unimportant channels removed)
+          keys_recent:  passed back unchanged (kept intact)
+          channel_mask: [B, H, D] bool, True = channel was pruned
+        """
+        B, H, S, D = key_states.shape
+        k = int(D * self.ratio)
+
+        scores = self._score_channels(key_states, query_states)          # [B, H, D]
+        # Select the k least important channel indices
+        _, prune_idx = torch.topk(scores, k, dim=-1, largest=False)      # [B, H, k]
+        prune_idx = prune_idx.sort(dim=-1).values
+
+        # Build boolean mask: True = pruned
+        mask = torch.zeros(B, H, D, dtype=torch.bool, device=key_states.device)
+        mask.scatter_(-1, prune_idx, True)                               # [B, H, D]
+
+        # Remove pruned channels from key_states
+        # mask_expand: [B, H, S, D]; use ~mask to KEEP channels
+        mask_expand = mask.unsqueeze(2).expand(-1, -1, S, -1)            # [B, H, S, D]
+        keys_pruned = key_states[~mask_expand].reshape(B, H, S, D - k)  # [B, H, S, D-k]
+
+        return keys_pruned, mask
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        ThinK only prunes during prefill (when seq_len > recent_size).
+        During decoding (seq_len == 1) we just append to the recent window.
+        Returns (full_keys, values) for use in attention.
+        """
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        query_states = cache_kwargs.get("query_states") if cache_kwargs else None
+        seq_len = key_states.shape[-2]
+        self.cumulative_length += seq_len
+
+        # ── PREFILL: prune channels on the non-recent portion ───────────────
+        if seq_len > self.recent_size and query_states is not None:
+            old_keys = key_states[:, :, :-self.recent_size, :]   # tokens to compress
+            new_recent = key_states[:, :, -self.recent_size:, :] # tokens kept intact
+
+            keys_pruned, mask = self._prune_channels(old_keys, query_states)
+
+            self.keys_pruned = keys_pruned   # [B, H, S-recent, D-k]
+            self.keys_recent = new_recent    # [B, H, recent,   D  ]
+            self.channel_mask = mask         # [B, H, D]
+            self.values = value_states       # values never pruned
+
+        # ── DECODE: append new token to recent window ────────────────────────
+        else:
+            if self.keys_recent is not None and self.keys_recent.numel() > 0:
+                self.keys_recent = torch.cat([self.keys_recent, key_states], dim=-2)
+            else:
+                # First decode step, or prefill was smaller than recent_size
+                self.keys_recent = key_states
+            self.values = torch.cat([self.values, value_states], dim=-2) \
+                if self.values.numel() > 0 else value_states
+
+        return self._reconstruct_keys(), self.values
+
+    def _reconstruct_keys(self) -> torch.Tensor:
+        """
+        Reconstruct full-dimensional keys from the pruned store + recent window,
+        padding pruned channels back to zero so attention can proceed normally.
+
+        Returns [B, H, total_seq_len, D]
+        """
+        # If prefill hasn't happened yet (decode-only path)
+        if self.keys_pruned is None or self.keys_pruned.numel() == 0:
+            return self.keys_recent
+
+        B, H, S_old, D_small = self.keys_pruned.shape
+        D_full = self.channel_mask.shape[-1]
+
+        # Scatter compressed keys back into a zero-padded full-dim tensor
+        mask_old = self.channel_mask.unsqueeze(2).expand(-1, -1, S_old, -1)  # [B,H,S_old,D]
+        keys_old_full = torch.zeros(B, H, S_old, D_full,
+                                    dtype=self.keys_pruned.dtype,
+                                    device=self.keys_pruned.device)
+        keys_old_full[~mask_old] = self.keys_pruned.reshape(-1)
+
+        return torch.cat([keys_old_full, self.keys_recent], dim=-2)
+
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        query_length = cache_position.shape[0]
+        kv_length = self.get_seq_length() + query_length
+        return kv_length, 0
+
+    def get_max_cache_shape(self) -> int:
+        return -1  # Dynamic, no maximum
 
 class Cache:
     """
@@ -1288,3 +1446,26 @@ class EncoderDecoderCache(Cache):
     @property
     def is_compileable(self) -> bool:
         return self.self_attention_cache.is_compileable
+
+class ThinKCache(Cache):
+    """
+    A cache that applies ThinK channel-level key pruning per layer.
+
+    Args:
+        config (`PreTrainedConfig`): Model config, used for num_hidden_layers.
+        recent_size (`int`): Number of recent tokens to keep uncompressed. Default 128.
+        ratio (`float`): Fraction of key channels to prune. Default 0.3.
+    """
+
+    def __init__(
+        self,
+        config: "PreTrainedConfig",
+        recent_size: int = 128,
+        ratio: float = 0.3,
+    ):
+        config = config.get_text_config(decoder=True)
+        layers = [
+            ThinKLayer(recent_size=recent_size, ratio=ratio)
+            for _ in range(config.num_hidden_layers)
+        ]
+        super().__init__(layers=layers)

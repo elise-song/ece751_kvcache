@@ -357,11 +357,13 @@ else:
         "StaticSlidingWindowLayer",
         "QuantoQuantizedLayer",
         "HQQQuantizedLayer",
+        "ThinKLayer",
         "Cache",
         "DynamicCache",
         "EncoderDecoderCache",
         "QuantizedCache",
         "StaticCache",
+        "ThinKCache",
     ]
     _import_structure["data.datasets"] = [
         "GlueDataset",
