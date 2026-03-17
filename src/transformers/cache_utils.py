@@ -722,15 +722,24 @@ class ThinKLayer(CacheLayerMixin):
         query_states: torch.Tensor, # [B, H, S, D]
     ) -> torch.Tensor:
         """
-        Compute per-channel importance as element-wise product of
-        mean-squared query and mean-squared key values.
-        Returns shape [B, H, D].
+        Compute per-channel importance scores, handling GQA by averaging
+        query heads within each KV head group before scoring.
+        Returns [B, num_kv_heads, D].
         """
-        # Use last 32 query positions for efficiency (following the paper)
-        q_norm = query_states[..., -32:, :].pow(2).mean(dim=2)   # [B, H, D]
-        k_norm = key_states.pow(2).mean(dim=2)                    # [B, H, D]
-        return q_norm * k_norm                                    # [B, H, D]
+        num_kv_heads = key_states.shape[1]
+        num_q_heads  = query_states.shape[1]
+        group_size   = num_q_heads // num_kv_heads  # e.g. 32 // 8 = 4
 
+        # Average query heads within each KV group: [B, num_kv_heads, S, D]
+        q = query_states[..., -32:, :]  # use last 32 positions for efficiency
+        if group_size > 1:
+            B, _, S, D = q.shape
+            q = q.reshape(B, num_kv_heads, group_size, S, D).mean(dim=2)  # [B, num_kv_heads, S, D]
+
+        q_norm = q.pow(2).mean(dim=2)              # [B, num_kv_heads, D]
+        k_norm = key_states.pow(2).mean(dim=2)     # [B, num_kv_heads, D]
+        return q_norm * k_norm                     # [B, num_kv_heads, D]
+    
     def _prune_channels(
         self,
         key_states: torch.Tensor,   # [B, H, S, D]
