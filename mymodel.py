@@ -23,7 +23,7 @@ past_key_values = ThinKCache(
 )
 
 generated_ids = model.generate(**inputs, past_key_values=past_key_values, use_cache=True, max_new_tokens=1024)
-print(tokenizer.decode(generated_ids[0]))
+print(tokenizer.decode(generated_ids[0][prompt_length:]))
 
 
 # print(model.get_memory_footprint)
