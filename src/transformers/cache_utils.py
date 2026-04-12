@@ -119,9 +119,7 @@ class DynamicLayer(CacheLayerMixin):
 
         self.keys = torch.cat([self.keys, key_states], dim=-2)
         self.values = torch.cat([self.values, value_states], dim=-2)
-        # torch.set_printoptions(profile="full")
-        # print(self.keys)
-        # print(self.values)
+        # print(self.keys.shape)
         return self.keys, self.values
 
     def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
@@ -846,6 +844,147 @@ class ThinKLayer(CacheLayerMixin):
     def get_max_cache_shape(self) -> int:
         return -1  # Dynamic, no maximum
 
+class H2OLayer(CacheLayerMixin):
+    """
+    Cache layer implementing H2O token pruning
+    It stores the key and value states as tensors of shape `[batch_size, num_heads, seq_len, head_dim]`
+    Based on 'H2OKVCache_LayerWise' in https://github.com/FMInference/H2O/blob/main/h2o_hf/utils_real_drop/modify_llama.py
+    """
+
+    is_sliding = False
+
+    def __init__(
+        self,
+        hh_size: int = 4,
+        recent_size: int = 512,
+        k_seq_dim: int = 2,
+        v_seq_dim: int = 2
+    ):
+        super().__init__()
+        self.hh_size = hh_size
+        self.recent_size = recent_size
+        self.cache_size = hh_size + recent_size
+        self.k_seq_dim = k_seq_dim
+        self.v_seq_dim = v_seq_dim
+        self.hh_score = None
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.dtype, self.device = key_states.dtype, key_states.device
+        self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.is_initialized = True
+
+    def keep_hh_recent(self, attn_scores: torch.Tensor) -> None:
+        self._update_hh_score(attn_scores)
+
+        if (self.keys is None) or (self.values is None):
+            return
+        seq_len = self.keys.size(self.k_seq_dim)
+        if seq_len <= self.cache_size:
+            return
+
+        # hh-selection
+        bsz, num_heads, _, head_dim = self.keys.shape
+
+        select_hh_scores = self.hh_score[:, :seq_len - self.recent_size]
+        _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
+        keep_topk = keep_topk.sort().values
+
+        # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
+        keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], 1)
+        keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
+
+        mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(self.keys.device)
+        mask = mask.scatter(-1, keep_idx, 1)
+
+        self.keys = self.keys.squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+        self.values = self.values.squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+
+        self.hh_score = self.hh_score[mask].view(num_heads, self.cache_size)
+
+    def _update_hh_score(self, attn_scores: torch.Tensor):
+        num_new_tokens = attn_scores.shape[2]
+        num_kv_heads = self.keys.shape[1]
+        num_attn_heads = attn_scores.shape[1]
+        if self.hh_score is None:
+            self.hh_score = attn_scores.sum(0).sum(1)
+            # GQA - sum scores across grouped heads
+            self.hh_score = self.hh_score.view(num_kv_heads, num_attn_heads // num_kv_heads, -1).sum(1)
+        else:
+            attn_scores = attn_scores.sum(0).sum(1)
+            attn_scores = attn_scores.view(num_kv_heads, num_attn_heads // num_kv_heads, -1).sum(1)
+            attn_scores[:, :-num_new_tokens] += self.hh_score
+            self.hh_score = attn_scores
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Update the key and value caches in-place, and return the necessary keys and value states.
+
+        Args:
+            key_states (`torch.Tensor`): The new key states to cache.
+            value_states (`torch.Tensor`): The new value states to cache.
+            cache_kwargs (`dict[str, Any]`, *optional*): Additional arguments for the cache.
+
+        Returns:
+            tuple[`torch.Tensor`, `torch.Tensor`]: The key and value states.
+        """
+        # Lazy initialization
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        self.keys = torch.cat([self.keys, key_states], dim=-2)
+        self.values = torch.cat([self.values, value_states], dim=-2)
+        return self.keys, self.values
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        """Return the length and offset of the cache, used to generate the mask"""
+        kv_offset = 0
+        query_length = cache_position.shape[0]
+        kv_length = self.get_seq_length() + query_length
+        return kv_length, kv_offset
+
+    def get_seq_length(self) -> int:
+        """Returns the sequence length of the cached states."""
+        if not self.is_initialized or self.keys.numel() == 0:
+            return 0
+        return self.keys.shape[-2]
+
+    def get_max_cache_shape(self) -> int:
+        """Returns the maximum sequence length of the cache object. DynamicLayer does not have a maximum length."""
+        return -1
+
+    def crop(self, max_length: int) -> None:
+        """
+        Crop the past key values up to a new `max_length` in terms of tokens. `max_length` can also be negative
+        to remove `max_length` tokens.
+        """
+        if max_length < 0:
+            max_length = self.get_seq_length() - abs(max_length)
+
+        if self.get_seq_length() <= max_length:
+            return
+
+        self.keys = self.keys[..., :max_length, :]
+        self.values = self.values[..., :max_length, :]
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        """Repeat the cache `repeats` times in the batch dimension."""
+        if self.get_seq_length() > 0:
+            self.keys = self.keys.repeat_interleave(repeats, dim=0)
+            self.values = self.values.repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        """Only keep the `indices` in the batch dimension of the cache."""
+        if self.get_seq_length() > 0:
+            self.keys = self.keys[indices, ...]
+            self.values = self.values[indices, ...]
+
+
 class Cache:
     """
     A `Cache` is mostly a list of `CacheLayerMixin` objects, one per model layer. It serves as a container for
@@ -1478,3 +1617,26 @@ class ThinKCache(Cache):
             for _ in range(config.num_hidden_layers)
         ]
         super().__init__(layers=layers)
+
+class H2OCache(Cache):
+    """
+    Cache composed of H2OLayer instances which implement H2O KV cache pruning
+    """
+
+    def __init__(
+        self,
+        config: PreTrainedConfig | None = None,
+        offloading: bool = False,
+        offload_only_non_sliding: bool = True,
+        hh_size: int = 4,
+        recent_size: int = 512,
+        k_seq_dim: int = 2,
+        v_seq_dim: int = 2
+    ):
+        config = config.get_text_config(decoder=True)
+        layers = []
+        for _ in range(config.num_hidden_layers):
+            layer = H2OLayer(hh_size=hh_size, recent_size=recent_size, k_seq_dim=k_seq_dim, v_seq_dim=v_seq_dim)
+            layers.append(layer)
+
+        super().__init__(layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)

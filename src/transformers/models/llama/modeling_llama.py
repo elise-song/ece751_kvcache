@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
+from ...cache_utils import Cache, DynamicCache, H2OCache
 from ...generation import GenerationMixin
 from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
 from ...masking_utils import create_causal_mask
@@ -293,6 +293,10 @@ class LlamaAttention(nn.Module):
             **kwargs,
         )
 
+        if type(past_key_values) is H2OCache:
+            assert(attn_weights is not None)
+            past_key_values.layers[self.layer_idx].keep_hh_recent(attn_weights.detach().clone())
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         # torch.set_printoptions(profile="full")
@@ -408,6 +412,13 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+
+            if type(past_key_values) is H2OCache:
+                if not (position_ids.nelement() > 1):
+                    # KV entries may have been pruned
+                    if past_seen_tokens < (position_ids.item() + 1):
+                        past_seen_tokens = position_ids.item() + 1
+
             cache_position: torch.Tensor = (
                 torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             )
