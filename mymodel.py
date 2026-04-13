@@ -1,5 +1,7 @@
 import torch
 from transformers import AutoTokenizer, LlamaForCausalLM, DynamicCache, H2OThinKCache, H2OCache, ThinKCache
+import statistics
+
 
 ratio = 0.4
 recent_size=128
@@ -25,6 +27,8 @@ past_key_values = H2OThinKCache(
 generated_ids = model.generate(**inputs, past_key_values=past_key_values, use_cache=True, max_new_tokens=1024)
 print(tokenizer.decode(generated_ids[0][prompt_length:]))
 
+times = model.model.layers[0].self_attn._attn_times  # or loop all layers
+print(statistics.mean(times))
 
 # print(model.get_memory_footprint)
 

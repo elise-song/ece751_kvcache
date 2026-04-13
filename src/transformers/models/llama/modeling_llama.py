@@ -44,7 +44,7 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, loggi
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_llama import LlamaConfig
-
+import time
 
 logger = logging.get_logger(__name__)
 
@@ -247,6 +247,9 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
+        
+        self._attn_times: list[float] = []  # accumulates per-step times
+
     
     # TODO: LlamaAttention.forward
     def forward(
@@ -282,6 +285,8 @@ class LlamaAttention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
 
+        start = time.perf_counter()
+
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -292,6 +297,9 @@ class LlamaAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+
+        self._attn_times.append(time.perf_counter() - start)
+
 
         if type(past_key_values) in (H2OCache, H2OThinKCache):
             assert(attn_weights is not None)
