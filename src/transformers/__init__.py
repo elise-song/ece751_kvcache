@@ -359,6 +359,7 @@ else:
         "HQQQuantizedLayer",
         "ThinKLayer",
         "H2OLayer",
+        "H2OThinKLayer",
         "Cache",
         "DynamicCache",
         "EncoderDecoderCache",
@@ -366,6 +367,7 @@ else:
         "StaticCache",
         "ThinKCache",
         "H2OCache",
+        "H2OThinKCache",
     ]
     _import_structure["data.datasets"] = [
         "GlueDataset",

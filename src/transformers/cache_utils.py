@@ -1640,3 +1640,164 @@ class H2OCache(Cache):
             layers.append(layer)
 
         super().__init__(layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
+
+class H2OThinKLayer(ThinKLayer):
+    """
+    Extends ThinKLayer with H2O token-level eviction.
+ 
+    After each attention step, call keep_hh_recent(attn_weights) to accumulate
+    attention scores and evict low-importance tokens, keeping the top `hh_size`
+    heavy-hitters plus the most recent `recent_size` tokens.
+ 
+    ThinK's channel pruning then runs as normal on the surviving non-recent tokens.
+ 
+    Args:
+        hh_size (`int`): Number of heavy-hitter tokens to retain. Default 4.
+        recent_size (`int`): Number of recent tokens always kept (shared with ThinK). Default 512.
+        ratio (`float`): Fraction of key channels to prune (passed to ThinKLayer). Default 0.3.
+        k_seq_dim (`int`): Sequence dimension of keys. Default 2.
+        v_seq_dim (`int`): Sequence dimension of values. Default 2.
+    """
+ 
+    def __init__(
+        self,
+        hh_size: int = 4,
+        recent_size: int = 512,
+        ratio: float = 0.3,
+        k_seq_dim: int = 2,
+        v_seq_dim: int = 2,
+    ):
+        super().__init__(recent_size=recent_size, ratio=ratio)
+        self.hh_size = hh_size
+        self.cache_size = hh_size + recent_size
+        self.k_seq_dim = k_seq_dim
+        self.v_seq_dim = v_seq_dim
+        self.hh_score: torch.Tensor | None = None
+ 
+    #  H2O helpers (from H2OLayer) 
+ 
+    def _update_hh_score(self, attn_scores: torch.Tensor) -> None:
+        """Accumulate attention scores across steps, collapsing GQA query heads."""
+        num_new_tokens = attn_scores.shape[2]
+        num_kv_heads   = self.keys_recent.shape[1] if (
+            self.keys_recent is not None and self.keys_recent.numel() > 0
+        ) else attn_scores.shape[1]
+        num_attn_heads = attn_scores.shape[1]
+ 
+        collapsed = attn_scores.sum(0).sum(1)  # [num_attn_heads, seq_len]
+        collapsed  = collapsed.view(
+            num_kv_heads, num_attn_heads // num_kv_heads, -1
+        ).sum(1)                               # [num_kv_heads, seq_len]
+ 
+        if self.hh_score is None:
+            self.hh_score = collapsed
+        else:
+            collapsed[:, :-num_new_tokens] += self.hh_score
+            self.hh_score = collapsed
+ 
+    def keep_hh_recent(self, attn_scores: torch.Tensor) -> None:
+        """
+        Called after attention with the softmax weights for this step.
+        Updates hh_score and evicts tokens if the cache exceeds cache_size.
+        Eviction works on the FULL reconstructed key sequence so that H2O
+        scores are aligned with actual positions before channel pruning splits
+        things into keys_pruned / keys_recent.
+        """
+        self._update_hh_score(attn_scores)
+ 
+        seq_len = self.cumulative_length
+        if seq_len <= self.cache_size:
+            return  # nothing to evict yet
+ 
+        # Reconstruct full-dim keys so eviction indices align with hh_score
+        all_keys = self._reconstruct_keys()   # [B, H, seq_len, D]
+        all_vals = self.values                 # [B, H, seq_len, D]
+        bsz, num_heads, _, head_dim = all_keys.shape
+ 
+        # Select heavy-hitters from the non-recent portion
+        select_scores = self.hh_score[:, : seq_len - self.recent_size]
+        _, keep_topk  = torch.topk(select_scores, self.hh_size, dim=-1)
+        keep_topk     = keep_topk.sort().values                           # [H, hh_size]
+ 
+        keep_recent = torch.arange(
+            seq_len - self.recent_size, seq_len, device=keep_topk.device
+        ).repeat(keep_topk.shape[0], 1)                                   # [H, recent_size]
+        keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)            # [H, cache_size]
+ 
+        mask = torch.zeros(self.hh_score.shape, dtype=torch.bool, device=all_keys.device)
+        mask = mask.scatter(-1, keep_idx, 1)                              # [H, seq_len]
+ 
+        # Apply mask — squeeze/view pattern mirrors H2OLayer.keep_hh_recent
+        surviving_keys = all_keys.squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+        surviving_vals = all_vals.squeeze()[mask].view(bsz, num_heads, -1, head_dim)
+        self.hh_score  = self.hh_score[mask].view(num_heads, self.cache_size)
+ 
+        # After eviction re-split into ThinK's pruned-old / recent structure.
+        # The heavy-hitter tokens sit at the front; re-apply channel pruning on them.
+        hh_keys     = surviving_keys[:, :, : self.hh_size, :]
+        recent_keys = surviving_keys[:, :, self.hh_size:,  :]
+ 
+        if self.ratio > 0.0 and hh_keys.shape[-2] > 0:
+            # Re-score channels using recent keys as query proxy
+            query_proxy = recent_keys if recent_keys.numel() > 0 else hh_keys
+            keys_pruned, mask_ch = self._prune_channels(hh_keys, query_proxy)
+            self.keys_pruned  = keys_pruned
+            self.channel_mask = mask_ch
+        else:
+            # ratio == 0: store heavy-hitters uncompressed in keys_pruned slot
+            self.keys_pruned  = hh_keys
+            self.channel_mask = None
+ 
+        self.keys_recent = recent_keys
+        self.values      = surviving_vals
+        self.cumulative_length = self.cache_size
+  
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+ 
+ 
+class H2OThinKCache(ThinKCache):
+    """
+    A KV-cache combining H2O token eviction with ThinK channel pruning,
+    implemented by composing both via H2OThinKLayer.
+ 
+    Inherits from ThinKCache; the only difference is that each layer
+    is an H2OThinKLayer instead of a plain ThinKLayer.
+ 
+    After each attention forward pass you must call:
+        past_key_values.layers[layer_idx].keep_hh_recent(attn_weights)
+    so that H2O can accumulate scores and evict low-importance tokens.
+ 
+    Args:
+        config (`PreTrainedConfig`): Model config, used for num_hidden_layers.
+        hh_size (`int`): Heavy-hitter token budget per layer. Default 4.
+        recent_size (`int`): Recent-token window (shared by H2O and ThinK). Default 512.
+        ratio (`float`): Fraction of key channels pruned by ThinK. Default 0.3.
+        k_seq_dim (`int`): Sequence dimension of keys. Default 2.
+        v_seq_dim (`int`): Sequence dimension of values. Default 2.
+    """
+ 
+    def __init__(
+        self,
+        config: "PreTrainedConfig",
+        hh_size: int = 4,
+        recent_size: int = 512,
+        ratio: float = 0.3,
+        k_seq_dim: int = 2,
+        v_seq_dim: int = 2,
+    ):
+        # Bypass ThinKCache.__init__ to supply H2OThinKLayer instances instead.
+        # Call Cache.__init__ directly (ThinKCache's grandparent) with our layers.
+        config_text = config.get_text_config(decoder=True)
+        layers = [
+            H2OThinKLayer(
+                hh_size=hh_size,
+                recent_size=recent_size,
+                ratio=ratio,
+                k_seq_dim=k_seq_dim,
+                v_seq_dim=v_seq_dim,
+            )
+            for _ in range(config_text.num_hidden_layers)
+        ]
+        Cache.__init__(self, layers=layers)
+ 
