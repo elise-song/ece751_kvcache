@@ -8,7 +8,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, H2OCache, H2OThinkCache
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, H2OCache, H2OThinKCache
 
 task2prompt = {
     "2wikimqa": "Answer the question based on the given passages.\n\nThe following are given passages.\n{context}\n\nNow, answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}",
@@ -155,7 +155,7 @@ def eval_dataset(args, model, tokenizer):
                 else:
                     hh_size = int(prompt_length * 0.1)
                 recent_size = args.recent_size
-                past_key_values = H2OThinkCache(config=model.config, hh_size=hh_size, recent_size=recent_size, ratio=args.think_ratio)
+                past_key_values = H2OThinKCache(config=model.config, hh_size=hh_size, recent_size=recent_size, ratio=args.think_ratio)
 
         try:
             output = model.generate(
