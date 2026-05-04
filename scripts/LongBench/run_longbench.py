@@ -8,7 +8,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, H2OCache
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, H2OCache, H2OThinkCache
 
 task2prompt = {
     "2wikimqa": "Answer the question based on the given passages.\n\nThe following are given passages.\n{context}\n\nNow, answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}",
@@ -97,6 +97,16 @@ def eval_dataset(args, model, tokenizer):
             hh = "h2r0.1"
         recent = f"recent{args.recent_size}"
         cache_info = f"{hh}_{recent}_"
+    elif args.method == "h2o_think":
+        if args.hh_size is not None:
+            hh = f"h2s{args.hh_size}"
+        elif args.hh_ratio is not None:
+            hh = f"h2r{args.hh_ratio}"
+        else:
+            hh = "h2r0.1"
+        recent = f"recent{args.recent_size}"
+        think = f"think{args.think_ratio}"
+        cache_info = f"{hh}_{recent}_{think}_"
 
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.method}_{cache_info}", args.dataset), exist_ok=True)
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.method}_{cache_info}", args.dataset, f"{args.method}.json"), "w")
@@ -137,6 +147,15 @@ def eval_dataset(args, model, tokenizer):
                     hh_size = int(prompt_length * 0.1)
                 recent_size = args.recent_size
                 past_key_values = H2OCache(config=model.config, hh_size=hh_size, recent_size=recent_size)
+            elif args.method == "h2o_think":
+                if args.hh_size is not None:
+                    hh_size = args.hh_size
+                elif args.hh_ratio is not None:
+                    hh_size = int(prompt_length * args.hh_ratio)
+                else:
+                    hh_size = int(prompt_length * 0.1)
+                recent_size = args.recent_size
+                past_key_values = H2OThinkCache(config=model.config, hh_size=hh_size, recent_size=recent_size, ratio=args.think_ratio)
 
         try:
             output = model.generate(
@@ -159,7 +178,7 @@ def eval_dataset(args, model, tokenizer):
         batch_outputs = tokenizer.batch_decode([output[0][prompt_length:]], skip_special_tokens=True)
         batch_n_generated = [len(output[0]) - prompt_length]
 
-        if args.method == "h2o":
+        if args.method in ("h2o", "h2o_think"):
             batch_kv_seq_len = [past_key_values.get_seq_length()]
         else:
             batch_kv_seq_len = [len(output[0])]
@@ -203,6 +222,7 @@ def main():
     parser.add_argument("--recent_size", type=int, default=32, help="Number of recent tokens to keep")
     parser.add_argument("--hh_size", type=int, default=None, help="Number of HH tokens to keep")
     parser.add_argument("--hh_ratio", type=float, default=None, help="Number of HH tokens to keep as fraction of prompt size")
+    parser.add_argument("--think_ratio", type=float, default=0.5, help="Think ratio for H2OThinkCache")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -217,7 +237,7 @@ def main():
 
     if args.method is None:
         args.method = "default"
-    elif args.method.lower() in ["h2o"]:
+    elif args.method.lower() in ["h2o", "h2o_think"]:
         args.method = args.method.lower()
     else:
         print(f"WARN: {args.method} is not a valid KV cache method, defaulting to default cache")
