@@ -1,0 +1,38 @@
+# gpu-lab.sub
+# sample submit file for GPU Lab jobs
+
+container_image = docker://esong216/pytorch-git:2.6.0
+universe = container
+
+log = job_$(Cluster)_$(Process).log
+error = job_$(Cluster)_$(Process).err
+output = job_$(Cluster)_$(Process).out
+
+# Fill in with whatever executable you're using
+executable = longbench.sh
+arguments = $(h2o) 
+ 
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+# Uncomment and add input files that are in /home
+# transfer_input_files = 
+transfer_output_files = ece751_kvcache/data
+
+
+# Uncomment and add custom requirements
+# requirements = 
+
++WantGPULab = true
++GPUJobLength = "short"
+
+request_gpus = 1
+request_cpus = 1
+request_memory = 64GB
+request_disk = 32GB
+
+require_gpus = (Capability > 8.0) && (Capability < 9)
+
+queue h2o from ratios.txt
+
+
